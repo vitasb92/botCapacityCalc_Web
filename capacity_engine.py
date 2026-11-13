@@ -184,6 +184,11 @@ def normalize_cartons(dataframe, default_flap_state="closed"):
 
 
 def analyze_cartons(dataframe, selected_configs, options):
+    results, _ = analyze_cartons_with_placements(dataframe, selected_configs, options)
+    return results
+
+
+def analyze_cartons_with_placements(dataframe, selected_configs, options):
     df_input = normalize_cartons(dataframe, options["carton_state"])
     conv_to_inch = 1 / 25.4 if options["metric"] else 1.0
     conv_to_lb = 1 / 0.453592 if options["metric"] else 1.0
@@ -199,6 +204,7 @@ def analyze_cartons(dataframe, selected_configs, options):
         overhang_override *= conv_to_inch
 
     outputs = {}
+    visual_outputs = {}
     for config_name in selected_configs:
         config = options["manual_config"] if config_name == "Manual Input" else DEFAULT_CONFIGS[config_name]
         config = dict(config)
@@ -240,18 +246,24 @@ def analyze_cartons(dataframe, selected_configs, options):
             ) / 2
 
         capacities, orientations, statuses, buffered_shelves = [], [], [], []
+        config_visuals = []
         for _, row in results.iterrows():
             carton_state = FLAP_STATE_CODES[row["Flap State"].casefold()]
             carton_stackable = options["stackable"] and carton_state == "closed"
             carton_max_density = options["max_density"] and carton_state == "closed"
             allow_3d = carton_state == "closed"
             adj_l, adj_w, adj_h = row["Eng_L"], row["Eng_W"], row["Eng_H"]
+            flap_extension = 0.0
+            flap_margin = 0.0
             if carton_state == "up":
-                adj_h += row["Eng_W"] / 2
+                flap_extension = row["Eng_W"] / 2
+                adj_h += flap_extension
             elif carton_state == "folded":
-                adj_l += 0.25
-                adj_w += 0.25
+                flap_margin = 0.25
+                adj_l += flap_margin
+                adj_w += flap_margin
             carton_dims = (adj_l, adj_w, adj_h)
+            shelf_fits = []
             if isinstance(shelf_h, list):
                 total, coords_by_shelf = 0, []
                 for height in heights:
@@ -268,6 +280,14 @@ def analyze_cartons(dataframe, selected_configs, options):
                     )
                     total += count
                     coords_by_shelf.append((usable_h, count, coords))
+                    shelf_fits.append(
+                        {
+                            "width": usable_l,
+                            "depth": usable_w,
+                            "height": usable_h,
+                            "placements": coords,
+                        }
+                    )
                 capacity = total
                 orientation = "Mixed (See Visuals)"
                 status = "Custom Fit" if total else "No Fit"
@@ -278,7 +298,7 @@ def analyze_cartons(dataframe, selected_configs, options):
                 )
             else:
                 usable_h = round(float(shelf_h) * factor, 2)
-                count, orientation, _ = calculate_packing(
+                count, orientation, coords = calculate_packing(
                     usable_l,
                     usable_w,
                     usable_h,
@@ -288,9 +308,9 @@ def analyze_cartons(dataframe, selected_configs, options):
                     carton_max_density,
                     options["workflow"],
                 )
-                hinge_count, hinge_orientation = 0, "N/A"
+                hinge_count, hinge_orientation, hinge_coords = 0, "N/A", []
                 if config.get("hinge_enabled", False) and count == 0:
-                    hinge_count, hinge_orientation, _ = calculate_packing(
+                    hinge_count, hinge_orientation, hinge_coords = calculate_packing(
                         hinge_l,
                         hinge_w,
                         hinge_h,
@@ -302,6 +322,15 @@ def analyze_cartons(dataframe, selected_configs, options):
                     )
                 if count:
                     capacity = count * shelf_count
+                    shelf_fits.append(
+                        {
+                            "width": usable_l,
+                            "depth": usable_w,
+                            "height": usable_h,
+                            "placements": coords,
+                            "identical_shelves": shelf_count,
+                        }
+                    )
                     status = "Standard Fit"
                     shelf_description = (
                         f"{round(usable_l * conv_to_display, 2)}W x "
@@ -311,6 +340,16 @@ def analyze_cartons(dataframe, selected_configs, options):
                 elif hinge_count:
                     capacity = hinge_count
                     orientation = hinge_orientation
+                    shelf_fits.append(
+                        {
+                            "width": hinge_l,
+                            "depth": hinge_w,
+                            "height": hinge_h,
+                            "placements": hinge_coords,
+                            "identical_shelves": 1,
+                            "hinge": True,
+                        }
+                    )
                     status = "Hinge Required"
                     shelf_description = (
                         f"{round(hinge_l * conv_to_display, 2)}W x "
@@ -321,6 +360,14 @@ def analyze_cartons(dataframe, selected_configs, options):
                     capacity = 0
                     orientation = "No Fit"
                     status = "No Fit"
+                    shelf_fits.append(
+                        {
+                            "width": usable_l,
+                            "depth": usable_w,
+                            "height": usable_h,
+                            "placements": [],
+                        }
+                    )
                     shelf_description = (
                         f"{round(usable_l * conv_to_display, 2)}W x "
                         f"{round(usable_w * conv_to_display, 2)}D x "
@@ -331,6 +378,19 @@ def analyze_cartons(dataframe, selected_configs, options):
             orientations.append(orientation)
             statuses.append(status)
             buffered_shelves.append(shelf_description)
+            config_visuals.append(
+                {
+                    "carton_body_dimensions": (
+                        row["Eng_L"],
+                        row["Eng_W"],
+                        row["Eng_H"],
+                    ),
+                    "flap_state": carton_state,
+                    "flap_extension": flap_extension,
+                    "flap_margin": flap_margin,
+                    "shelves": shelf_fits,
+                }
+            )
 
         results["Total Cartons per Bot"] = capacities
         results["Best Orientation (LxWxH)"] = orientations
@@ -345,6 +405,17 @@ def analyze_cartons(dataframe, selected_configs, options):
                     if row["Total Cartons per Bot"] > limit:
                         results.at[index, "Total Cartons per Bot"] = limit
                         results.at[index, "Fit Status"] = "Capped by Weight"
+
+        for visual, (_, row) in zip(config_visuals, results.iterrows()):
+            remaining = int(row["Total Cartons per Bot"])
+            for shelf in visual["shelves"]:
+                placements = shelf["placements"]
+                if isinstance(shelf_h, list):
+                    shelf["placements"] = placements[:remaining]
+                    remaining = max(0, remaining - len(shelf["placements"]))
+                elif len(placements) > remaining:
+                    shelf["placements"] = placements[:remaining]
+                    remaining = 0
 
         results["Raw Missions"] = results.apply(
             lambda row: row["Usage %"] / row["Total Cartons per Bot"]
@@ -376,8 +447,9 @@ def analyze_cartons(dataframe, selected_configs, options):
             inplace=True,
         )
         outputs[config_name] = results
+        visual_outputs[config_name] = config_visuals
 
-    return outputs
+    return outputs, visual_outputs
 
 
 def make_workbook(results):

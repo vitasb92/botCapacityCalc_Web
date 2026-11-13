@@ -5,7 +5,13 @@ from unittest.mock import patch
 import pandas as pd
 from openpyxl import load_workbook
 
-from capacity_engine import analyze_cartons, calculate_packing, make_workbook, normalize_cartons
+from capacity_engine import (
+    analyze_cartons,
+    analyze_cartons_with_placements,
+    calculate_packing,
+    make_workbook,
+    normalize_cartons,
+)
 
 
 class PackingTests(unittest.TestCase):
@@ -54,6 +60,68 @@ class PackingTests(unittest.TestCase):
         result = analyze_cartons(cartons, ["Manual Input"], options)["Manual Input"]
         self.assertEqual(result.loc[0, "Total Cartons per Bot"], 8)
 
+    def test_visual_placements_follow_weight_capped_capacity(self):
+        cartons = pd.DataFrame(
+            {"Carton Name": ["Sample"], "Length": [5], "Width": [5], "Height": [5], "Weight": [1]}
+        )
+        options = {
+            "metric": False,
+            "carton_state": "closed",
+            "stackable": True,
+            "max_density": False,
+            "workflow": "p2p",
+            "overhang": None,
+            "manual_config": {
+                "width": 10,
+                "depth": 10,
+                "hgt": 10,
+                "shelves": 1,
+                "buffer": 0,
+                "hinge_hgt": 0,
+                "hinge_enabled": False,
+                "payload": 5,
+            },
+        }
+
+        results, visuals = analyze_cartons_with_placements(
+            cartons, ["Manual Input"], options
+        )
+
+        self.assertEqual(results["Manual Input"].loc[0, "Total Cartons per Bot"], 5)
+        self.assertEqual(len(visuals["Manual Input"][0]["shelves"][0]["placements"]), 5)
+        self.assertEqual(
+            visuals["Manual Input"][0]["shelves"][0]["placements"][0],
+            {"x": 0, "y": 0, "z": 0, "l": 5, "w": 5, "h": 5},
+        )
+        self.assertNotIn("placements", results["Manual Input"].columns)
+
+    def test_visual_placements_preserve_each_manual_shelf_height(self):
+        cartons = pd.DataFrame({"Length": [5], "Width": [5], "Height": [5]})
+        options = {
+            "metric": False,
+            "carton_state": "closed",
+            "stackable": True,
+            "max_density": False,
+            "workflow": "p2p",
+            "overhang": None,
+            "manual_config": {
+                "width": 10,
+                "depth": 10,
+                "hgt": [5, 10],
+                "shelves": 1,
+                "buffer": 0,
+                "hinge_hgt": 0,
+                "hinge_enabled": False,
+                "payload": 0,
+            },
+        }
+
+        _, visuals = analyze_cartons_with_placements(cartons, ["Manual Input"], options)
+        shelves = visuals["Manual Input"][0]["shelves"]
+
+        self.assertEqual([shelf["height"] for shelf in shelves], [5, 10])
+        self.assertEqual([len(shelf["placements"]) for shelf in shelves], [4, 8])
+
     def test_per_carton_flap_states_override_global_and_blank_uses_global(self):
         cartons = pd.DataFrame(
             {
@@ -82,10 +150,29 @@ class PackingTests(unittest.TestCase):
             },
         }
 
-        result = analyze_cartons(cartons, ["Manual Input"], options)["Manual Input"]
+        result, visuals = analyze_cartons_with_placements(
+            cartons, ["Manual Input"], options
+        )
+        result = result["Manual Input"]
 
         self.assertEqual(list(result["Flap State"]), ["Flaps Up", "Closed/Case", "Flaps Down"])
         self.assertEqual(list(result["Total Cartons per Bot"]), [16, 48, 9])
+        self.assertEqual(
+            [visual["flap_state"] for visual in visuals["Manual Input"]],
+            ["up", "closed", "folded"],
+        )
+        self.assertEqual(
+            [visual["carton_body_dimensions"] for visual in visuals["Manual Input"]],
+            [(5, 5, 5)] * 3,
+        )
+        self.assertEqual(
+            [visual["flap_extension"] for visual in visuals["Manual Input"]],
+            [2.5, 0, 0],
+        )
+        self.assertEqual(
+            [visual["flap_margin"] for visual in visuals["Manual Input"]],
+            [0, 0, 0.25],
+        )
         workbook = load_workbook(
             BytesIO(make_workbook({"Manual Input": result})), read_only=True
         )
@@ -153,9 +240,16 @@ class PackingTests(unittest.TestCase):
         }
 
         with patch("capacity_engine.calculate_packing", wraps=calculate_packing) as packing:
-            result = analyze_cartons(cartons, ["Manual Input"], options)["Manual Input"]
+            result, visuals = analyze_cartons_with_placements(
+                cartons, ["Manual Input"], options
+            )
+            result = result["Manual Input"]
 
         self.assertEqual(list(result["Total Cartons per Bot"]), [8, 16])
+        self.assertEqual(
+            [visual["flap_state"] for visual in visuals["Manual Input"]],
+            ["no_flaps", "closed"],
+        )
         self.assertEqual(packing.call_args_list[0].args[4:7], (False, False, False))
         self.assertEqual(packing.call_args_list[1].args[4:7], (False, True, True))
 
