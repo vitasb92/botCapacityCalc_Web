@@ -26,6 +26,30 @@ class PackingTests(unittest.TestCase):
         self.assertEqual(p2p_count, 16)
         self.assertEqual(pick_put_count, 8)
 
+    def test_decimal_exact_fits_are_not_undercounted_by_float_rounding(self):
+        for max_density in (False, True):
+            with self.subTest(max_density=max_density):
+                count, _, _ = calculate_packing(
+                    0.3,
+                    0.2,
+                    0.3,
+                    (0.1, 0.1, 0.1),
+                    stackable=True,
+                    allow_3d=False,
+                    max_density=max_density,
+                )
+                self.assertEqual(count, 18)
+
+        count, _, _ = calculate_packing(
+            0.29999,
+            0.2,
+            0.3,
+            (0.1, 0.1, 0.1),
+            stackable=True,
+            allow_3d=False,
+        )
+        self.assertEqual(count, 12)
+
     def test_normalize_cartons_maps_dimensions_and_rejects_nonpositive_values(self):
         cartons = normalize_cartons(
             pd.DataFrame({"Width (X)": [10], "Depth (Y)": [8], "Height": [4]})
@@ -34,6 +58,26 @@ class PackingTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "positive Length"):
             normalize_cartons(pd.DataFrame({"Length": [0], "Width": [8], "Height": [4]}))
+
+    def test_normalize_cartons_trims_outer_whitespace_but_rejects_embedded_spaces(self):
+        cartons = normalize_cartons(
+            pd.DataFrame(
+                {
+                    "Length": ["\u00a013.5\u00a0"],
+                    "Width": [" 5.25 "],
+                    "Height": ["8.75\t"],
+                }
+            )
+        )
+        self.assertEqual(
+            list(cartons[["Length", "Width", "Height"]].iloc[0]),
+            [13.5, 5.25, 8.75],
+        )
+
+        with self.assertRaisesRegex(ValueError, "positive Length"):
+            normalize_cartons(
+                pd.DataFrame({"Length": ["1 3"], "Width": [5], "Height": [8]})
+            )
 
     def test_manual_configuration_applies_stack_count(self):
         cartons = pd.DataFrame({"Length": [5], "Width": [5], "Height": [5]})
@@ -58,6 +102,37 @@ class PackingTests(unittest.TestCase):
         }
 
         result = analyze_cartons(cartons, ["Manual Input"], options)["Manual Input"]
+        self.assertEqual(result.loc[0, "Total Cartons per Bot"], 8)
+
+    def test_analysis_uses_the_supplied_live_configuration_set(self):
+        cartons = pd.DataFrame({"Length": [5], "Width": [5], "Height": [5]})
+        options = {
+            "metric": False,
+            "carton_state": "closed",
+            "stackable": True,
+            "max_density": False,
+            "workflow": "p2p",
+            "overhang": None,
+            "manual_config": {},
+        }
+        configs = {
+            "Edited Bot": {
+                "width": 10,
+                "depth": 10,
+                "hgt": 10,
+                "overhang": 0,
+                "shelves": 1,
+                "buffer": 0,
+                "hinge_hgt": 0,
+                "hinge_enabled": False,
+                "payload": 0,
+            }
+        }
+
+        result = analyze_cartons(
+            cartons, ["Edited Bot"], options, configs=configs
+        )["Edited Bot"]
+
         self.assertEqual(result.loc[0, "Total Cartons per Bot"], 8)
 
     def test_visual_placements_follow_weight_capped_capacity(self):

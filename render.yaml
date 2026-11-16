@@ -4,3 +4,10 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
+    disk:
+      name: bot-config-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: BOT_CONFIG_DB
+        value: /var/data/bot_configs.sqlite3

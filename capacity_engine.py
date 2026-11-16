@@ -21,15 +21,23 @@ FLAP_STATE_LABELS = {code: label for code, label in FLAP_STATES.values()}
 FLAP_STATE_CODES = {label.casefold(): code for code, label in FLAP_STATES.values()}
 
 
+def _fit_count(available, item_dimension):
+    ratio = available / item_dimension
+    nearest_integer = round(ratio)
+    if math.isclose(ratio, nearest_integer, rel_tol=1e-12, abs_tol=1e-12):
+        ratio = nearest_integer
+    return math.floor(ratio)
+
+
 def get_best_homogeneous(e_l, e_w, e_h, rotations, stackable, workflow="p2p", x0=0, y0=0, z0=0):
     best_coords, max_count = [], 0
     for bl, bw, bh in rotations:
         if bl <= 0 or bw <= 0 or bh <= 0:
             continue
-        fit_l, fit_w = int(e_l // bl), int(e_w // bw)
+        fit_l, fit_w = _fit_count(e_l, bl), _fit_count(e_w, bw)
         if workflow == "pick_put":
             fit_w = min(1, fit_w)
-        fit_h = int(e_h // bh) if stackable else (1 if bh <= e_h else 0)
+        fit_h = _fit_count(e_h, bh) if stackable else min(1, _fit_count(e_h, bh))
         count = fit_l * fit_w * fit_h
         if count > max_count:
             max_count = count
@@ -75,10 +83,10 @@ def calculate_packing(
     for bl, bw, bh in rotations:
         if bl <= 0 or bw <= 0 or bh <= 0:
             continue
-        fit_l, fit_w = int(e_l // bl), int(e_w // bw)
+        fit_l, fit_w = _fit_count(e_l, bl), _fit_count(e_w, bw)
         if workflow == "pick_put":
             fit_w = min(1, fit_w)
-        fit_h = int(e_h // bh) if stackable else (1 if bh <= e_h else 0)
+        fit_h = _fit_count(e_h, bh) if stackable else min(1, _fit_count(e_h, bh))
         if fit_l * fit_w * fit_h == 0:
             continue
 
@@ -142,7 +150,10 @@ def normalize_cartons(dataframe, default_flap_state="closed"):
         raise ValueError("Input must include Length/Width, and Height columns.")
 
     for column in ("Length", "Width", "Height"):
-        df[column] = pd.to_numeric(df[column], errors="coerce")
+        dimension_values = df[column].map(
+            lambda value: value.strip() if isinstance(value, str) else value
+        )
+        df[column] = pd.to_numeric(dimension_values, errors="coerce")
         invalid = df[column].isna() | ~df[column].map(math.isfinite) | (df[column] <= 0)
         if invalid.any():
             raise ValueError(f"Every carton needs a valid positive {column} value.")
@@ -183,13 +194,16 @@ def normalize_cartons(dataframe, default_flap_state="closed"):
     return df
 
 
-def analyze_cartons(dataframe, selected_configs, options):
-    results, _ = analyze_cartons_with_placements(dataframe, selected_configs, options)
+def analyze_cartons(dataframe, selected_configs, options, configs=None):
+    results, _ = analyze_cartons_with_placements(
+        dataframe, selected_configs, options, configs=configs
+    )
     return results
 
 
-def analyze_cartons_with_placements(dataframe, selected_configs, options):
+def analyze_cartons_with_placements(dataframe, selected_configs, options, configs=None):
     df_input = normalize_cartons(dataframe, options["carton_state"])
+    available_configs = DEFAULT_CONFIGS if configs is None else configs
     conv_to_inch = 1 / 25.4 if options["metric"] else 1.0
     conv_to_lb = 1 / 0.453592 if options["metric"] else 1.0
     conv_to_display = 25.4 if options["metric"] else 1.0
@@ -206,7 +220,11 @@ def analyze_cartons_with_placements(dataframe, selected_configs, options):
     outputs = {}
     visual_outputs = {}
     for config_name in selected_configs:
-        config = options["manual_config"] if config_name == "Manual Input" else DEFAULT_CONFIGS[config_name]
+        config = (
+            options["manual_config"]
+            if config_name == "Manual Input"
+            else available_configs[config_name]
+        )
         config = dict(config)
         if config_name == "Manual Input":
             for key in ("width", "depth", "hgt", "hinge_hgt", "hng_width", "hng_depth"):
