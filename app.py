@@ -1,5 +1,7 @@
 import hashlib
 import io
+import math
+import re
 import sqlite3
 
 import pandas as pd
@@ -7,135 +9,32 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from aisle_width_engine import (
+    AISLE_PROFILES,
+    TRAFFIC_PATTERNS,
+    calculate_aisle_widths,
+)
+from aisle_graphic import create_aisle_requirements_png
 from capacity_engine import analyze_cartons_with_placements, make_workbook
 from config_store import (
     MANUAL_CONFIG_NAME,
     delete_config,
     format_config_label,
+    load_aisle_mappings,
+    load_aisle_settings,
     load_config_records,
+    save_aisle_mappings,
+    save_aisle_settings,
     save_config,
 )
 
 
-VISUALIZATION_SCHEMA_VERSION = 1
+VISUALIZATION_SCHEMA_VERSION = 2
 
 
 st.set_page_config(page_title="Bot Capacity Calculator", page_icon="📦", layout="wide")
-header_title, header_animation = st.columns([5, 1], vertical_alignment="center")
-with header_title:
-    st.title("Bot Capacity Calculator")
-    st.caption("Estimate carton capacity for Locus robot shelf configurations.")
-with header_animation:
-    st.html(
-        """
-        <style>
-          #capacity-carton-animation {
-            height: 150px; display: grid; place-items: center; perspective: 650px;
-          }
-          #capacity-carton-animation .carton {
-            position: relative; width: 100px; height: 72px;
-            transform-style: preserve-3d; animation: capacity-carton-spin 9s linear infinite;
-          }
-          #capacity-carton-animation .face, #capacity-carton-animation .flap {
-            position: absolute; box-sizing: border-box;
-            border: 2px solid #754116;
-            background:
-              repeating-linear-gradient(90deg, rgba(88, 57, 30, 0.035) 0 1px, transparent 1px 6px),
-              linear-gradient(145deg, #dfb783, #c38c53);
-            backface-visibility: visible;
-          }
-          #capacity-carton-animation .front, #capacity-carton-animation .back {
-            width: 100px; height: 72px;
-          }
-          #capacity-carton-animation .front { transform: translateZ(34px); }
-          #capacity-carton-animation .back { transform: rotateY(180deg) translateZ(34px); }
-          #capacity-carton-animation .side {
-            top: 0; left: 18px; width: 64px; height: 72px;
-          }
-          #capacity-carton-animation .left { transform: rotateY(-90deg) translateZ(50px); }
-          #capacity-carton-animation .right { transform: rotateY(90deg) translateZ(50px); }
-          #capacity-carton-animation .bottom {
-            top: 40px; left: 0; width: 100px; height: 64px;
-            transform: rotateX(90deg);
-            background: #986a40;
-          }
-          #capacity-carton-animation .flap {
-            position: absolute; top: -34px; height: 34px;
-            transform-origin: 50% 100%; transform-style: preserve-3d;
-          }
-          #capacity-carton-animation .flap-front,
-          #capacity-carton-animation .flap-back {
-            width: 100px; left: 0;
-          }
-          #capacity-carton-animation .flap-front {
-            transform: translateZ(34px) rotateX(90deg);
-            animation: capacity-carton-front-flap 6s ease-in-out infinite;
-          }
-          #capacity-carton-animation .flap-back {
-            transform: translateZ(-34px) rotateX(-90deg);
-            animation: capacity-carton-back-flap 6s ease-in-out infinite;
-          }
-          #capacity-carton-animation .flap-side {
-            top: -50px; left: -32px; width: 64px; height: 50px;
-          }
-          #capacity-carton-animation .flap-left {
-            transform: rotateZ(90deg) rotateY(90deg);
-            animation: capacity-carton-left-flap 6s ease-in-out infinite;
-          }
-          #capacity-carton-animation .flap-right {
-            left: 68px;
-            transform: rotateZ(-90deg) rotateY(90deg);
-            animation: capacity-carton-right-flap 6s ease-in-out infinite;
-          }
-          @keyframes capacity-carton-spin {
-            from { transform: rotateX(-18deg) rotateY(0deg); }
-            to { transform: rotateX(-18deg) rotateY(360deg); }
-          }
-          @keyframes capacity-carton-front-flap {
-            0%, 12% { transform: translateZ(34px) rotateX(90deg); }
-            26%, 34% { transform: translateZ(34px) rotateX(0deg); }
-            44%, 60% { transform: translateZ(34px) rotateX(-90deg); }
-            72%, 78% { transform: translateZ(34px) rotateX(-180deg); }
-            94%, 100% { transform: translateZ(34px) rotateX(-270deg); }
-          }
-          @keyframes capacity-carton-back-flap {
-            0%, 12% { transform: translateZ(-34px) rotateX(-90deg); }
-            26%, 34% { transform: translateZ(-34px) rotateX(0deg); }
-            44%, 60% { transform: translateZ(-34px) rotateX(90deg); }
-            72%, 78% { transform: translateZ(-34px) rotateX(180deg); }
-            94%, 100% { transform: translateZ(-34px) rotateX(270deg); }
-          }
-          @keyframes capacity-carton-left-flap {
-            0%, 12% { transform: rotateZ(90deg) rotateY(90deg); }
-            26%, 34% { transform: rotateZ(0deg) rotateY(90deg); }
-            44%, 60% { transform: rotateZ(-90deg) rotateY(90deg); }
-            72%, 78% { transform: rotateZ(-180deg) rotateY(90deg); }
-            94%, 100% { transform: rotateZ(-270deg) rotateY(90deg); }
-          }
-          @keyframes capacity-carton-right-flap {
-            0%, 12% { transform: rotateZ(-90deg) rotateY(90deg); }
-            26%, 34% { transform: rotateZ(0deg) rotateY(90deg); }
-            44%, 60% { transform: rotateZ(90deg) rotateY(90deg); }
-            72%, 78% { transform: rotateZ(180deg) rotateY(90deg); }
-            94%, 100% { transform: rotateZ(270deg) rotateY(90deg); }
-          }
-          @media (prefers-reduced-motion: reduce) {
-            #capacity-carton-animation .carton,
-            #capacity-carton-animation .flap { animation: none !important; }
-          }
-        </style>
-        <div id="capacity-carton-animation" role="img" aria-label="A carton spinning as its flaps open and close">
-          <div class="carton">
-            <div class="face front"></div><div class="face back"></div>
-            <div class="face side left"></div><div class="face side right"></div>
-            <div class="face bottom"></div>
-            <div class="flap flap-front"></div><div class="flap flap-back"></div>
-            <div class="flap flap-side flap-left"></div>
-            <div class="flap flap-side flap-right"></div>
-          </div>
-        </div>
-        """,
-    )
+st.title("Bot Capacity Calculator")
+st.caption("Estimate carton capacity for Locus robot shelf configurations.")
 
 
 def configuration_editor_fields(config, key_prefix):
@@ -261,8 +160,10 @@ def parse_configuration_fields(fields):
 
 try:
     config_records = load_config_records()
+    aisle_mappings = load_aisle_mappings()
+    aisle_settings = load_aisle_settings()
 except (sqlite3.Error, OSError, ValueError) as error:
-    st.error(f"Could not load bot configurations: {error}")
+    st.error(f"Could not load configuration data: {error}")
     st.stop()
 
 active_configs = {
@@ -311,7 +212,30 @@ def configuration_family_editor(label, key_prefix, current_family=None):
         return new_family
     return selected_family
 
-analysis_tab, configuration_tab = st.tabs(["Capacity analysis", "Manage configurations"])
+
+def format_carton_label(row, row_number):
+    name = row.get("Carton Name")
+    if pd.isna(name) or not str(name).strip():
+        name = row.get("SKU")
+    label = f"Carton {row_number + 1}"
+    if not pd.isna(name) and str(name).strip():
+        label += f" - {name}"
+    return label
+
+
+def format_aisle_distance(distance_mm, metric):
+    if metric:
+        return f"{distance_mm:.1f} mm"
+    return f"{distance_mm / 25.4:.2f} in"
+
+analysis_tab, configuration_tab, aisle_configuration_tab, layout_preview_tab = st.tabs(
+    [
+        "Capacity analysis",
+        "Manage Bot Configurations",
+        "Aisle Width Configuration",
+        "Layout Previews",
+    ]
+)
 with analysis_tab:
     with st.sidebar:
         st.header("Analysis settings")
@@ -549,6 +473,37 @@ with analysis_tab:
             )
         )
 
+        physical_width = shelf.get("physical_width", shelf["width"]) * display_factor
+        core_depth = shelf.get("core_depth", shelf["depth"]) * display_factor
+        overhang_depth = shelf.get("overhang_depth", 0.0) * display_factor
+
+        def add_shelf_region(name, start_depth, end_depth, color):
+            if end_depth <= start_depth:
+                return
+            figure.add_trace(
+                go.Mesh3d(
+                    x=[0, physical_width, physical_width, 0],
+                    y=[start_depth, start_depth, end_depth, end_depth],
+                    z=[0, 0, 0, 0],
+                    i=[0, 0],
+                    j=[1, 2],
+                    k=[2, 3],
+                    color=color,
+                    opacity=0.55,
+                    flatshading=True,
+                    name=name,
+                    hoverinfo="skip",
+                )
+            )
+
+        add_shelf_region("Core shelf", 0, core_depth, "#64748b")
+        add_shelf_region(
+            "Overhang extension",
+            core_depth,
+            core_depth + overhang_depth,
+            "#14b8a6",
+        )
+
         body_mesh = {"x": [], "y": [], "z": [], "i": [], "j": [], "k": []}
         flap_mesh = {"x": [], "y": [], "z": [], "i": [], "j": [], "k": []}
         body_edge_x, body_edge_y, body_edge_z = [], [], []
@@ -780,6 +735,7 @@ with analysis_tab:
     st.session_state.setdefault("analysis_visuals", None)
     st.session_state.setdefault("analysis_visual_schema_version", 0)
     st.session_state.setdefault("analysis_is_optimized", False)
+    st.session_state.setdefault("analysis_metric", metric)
 
     if run_analysis:
         st.session_state["analysis_results"] = None
@@ -787,6 +743,7 @@ with analysis_tab:
         st.session_state["analysis_visuals"] = None
         st.session_state["analysis_visual_schema_version"] = 0
         st.session_state["analysis_is_optimized"] = False
+        st.session_state["analysis_metric"] = metric
         st.session_state.pop("configuration_details_selector", None)
         st.session_state.pop("carton_fit_selector", None)
         if optimize:
@@ -863,7 +820,7 @@ with analysis_tab:
             x="Sum of Weighted Average",
             y="Configuration",
             orientation="h",
-            title="Weighted average cartons per bot",
+            title="Preview weighted average cartons per bot",
         )
         st.plotly_chart(chart, use_container_width=True)
 
@@ -874,6 +831,177 @@ with analysis_tab:
         )
         detail_results = results[detail_config]
         st.dataframe(detail_results, use_container_width=True, hide_index=True)
+
+        st.subheader("Aisle width recommendations")
+        aisle_graphic_data = None
+        aisle_mapping = aisle_mappings.get(detail_config)
+        if aisle_mapping is None:
+            st.info(
+                f"No aisle profile is mapped to '{detail_config}'. "
+                "Add a mapping in Manage Bot Configurations to calculate aisle widths."
+            )
+        else:
+            st.caption(
+                f"Mapped profile: {aisle_mapping['aisle_profile']} · "
+                f"Robot width: {aisle_mapping['robot_width_mm']:g} mm. "
+                "Carton Length is treated as width (X), Width as depth (Y); "
+                "flaps-up height includes the flap extension."
+            )
+            if AISLE_PROFILES[aisle_mapping["aisle_profile"]]["type"] == "VECTOR":
+                st.caption(
+                    "Vector aisle recommendations use the editable profile requirements; "
+                    "the mapped robot width is recorded for reference."
+                )
+
+            input_to_mm = (
+                1.0
+                if st.session_state.get("analysis_metric", metric)
+                else 25.4
+            )
+            aisle_rows = []
+            aisle_calculations = []
+            try:
+                for row_number, (_, carton) in enumerate(detail_results.iterrows()):
+                    carton_height = carton["Height"]
+                    if (
+                        "Height with Flaps" in carton.index
+                        and carton.get("Flap State") == "Flaps Up"
+                    ):
+                        carton_height = carton["Height with Flaps"]
+                    calculation = calculate_aisle_widths(
+                        aisle_mapping["aisle_profile"],
+                        aisle_mapping["robot_width_mm"],
+                        float(carton["Length"]) * input_to_mm,
+                        float(carton["Width"]) * input_to_mm,
+                        float(carton_height) * input_to_mm,
+                        aisle_settings=aisle_settings,
+                    )
+                    label = format_carton_label(carton, row_number)
+                    aisle_calculations.append((label, calculation))
+                    row_values = {
+                        "Carton": label,
+                        "Largest optimal aisle need": "",
+                    }
+                    for traffic_key, traffic_label in zip(
+                        ("one_way", "two_way", "three_way"), TRAFFIC_PATTERNS
+                    ):
+                        row_values[f"{traffic_label} minimum"] = format_aisle_distance(
+                            calculation["minimum_mm"][traffic_key], metric
+                        )
+                        row_values[f"{traffic_label} optimal"] = format_aisle_distance(
+                            calculation["optimal_mm"][traffic_key], metric
+                        )
+                    row_values["Warnings"] = "; ".join(calculation["warnings"])
+                    aisle_rows.append(row_values)
+            except (KeyError, TypeError, ValueError) as error:
+                st.error(f"Could not calculate aisle recommendations: {error}")
+            else:
+                if not aisle_calculations:
+                    st.info("No carton rows are available for aisle-width analysis.")
+                else:
+                    limiting_rows = []
+                    graphic_scenarios = []
+                    limiting_patterns = {}
+                    for traffic_key, traffic_label in zip(
+                        ("one_way", "two_way", "three_way"), TRAFFIC_PATTERNS
+                    ):
+                        minimum_index = max(
+                            range(len(aisle_calculations)),
+                            key=lambda index: aisle_calculations[index][1]["minimum_mm"][
+                                traffic_key
+                            ],
+                        )
+                        optimal_width = max(
+                            calculation["optimal_mm"][traffic_key]
+                            for _, calculation in aisle_calculations
+                        )
+                        optimal_indexes = [
+                            index
+                            for index, (_, calculation) in enumerate(aisle_calculations)
+                            if math.isclose(
+                                calculation["optimal_mm"][traffic_key],
+                                optimal_width,
+                                rel_tol=0.0,
+                                abs_tol=1e-9,
+                            )
+                        ]
+                        minimum_carton, minimum_calculation = aisle_calculations[minimum_index]
+                        optimal_cartons = [
+                            aisle_calculations[index][0] for index in optimal_indexes
+                        ]
+                        optimal_calculation = aisle_calculations[optimal_indexes[0]][1]
+                        graphic_scenarios.append(
+                            {
+                                "traffic_pattern": traffic_label,
+                                "minimum_width_mm": minimum_calculation["minimum_mm"][
+                                    traffic_key
+                                ],
+                                "minimum_carton": minimum_carton,
+                                "optimal_width_mm": optimal_calculation["optimal_mm"][
+                                    traffic_key
+                                ],
+                                "optimal_carton": "; ".join(optimal_cartons),
+                            }
+                        )
+                        for index in optimal_indexes:
+                            limiting_patterns.setdefault(index, []).append(traffic_label)
+                        limiting_rows.append(
+                            {
+                                "Traffic pattern": traffic_label,
+                                "Minimum limiting carton": minimum_carton,
+                                "Minimum aisle width": format_aisle_distance(
+                                    minimum_calculation["minimum_mm"][traffic_key], metric
+                                ),
+                                "Optimal limiting carton": "; ".join(optimal_cartons),
+                                "Optimal aisle width": format_aisle_distance(
+                                    optimal_calculation["optimal_mm"][traffic_key], metric
+                                ),
+                            }
+                        )
+                    for index, traffic_labels in limiting_patterns.items():
+                        aisle_rows[index]["Largest optimal aisle need"] = "; ".join(
+                            traffic_labels
+                        )
+                    aisle_dataframe = pd.DataFrame(aisle_rows)
+                    aisle_dataframe = aisle_dataframe.style.apply(
+                        lambda row: (
+                            ["background-color: #fff3cd; font-weight: bold;"]
+                            * len(row)
+                            if row["Largest optimal aisle need"]
+                            else [""] * len(row)
+                        ),
+                        axis=1,
+                    )
+                    st.caption(
+                        "Highlighted cartons set the largest optimal aisle width for the listed traffic patterns."
+                    )
+                    st.dataframe(
+                        aisle_dataframe,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.markdown("**Limiting carton by traffic pattern**")
+                    st.dataframe(
+                        pd.DataFrame(limiting_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    warnings = sorted(
+                        {
+                            warning
+                            for _, calculation in aisle_calculations
+                            for warning in calculation["warnings"]
+                        }
+                    )
+                    if warnings:
+                        st.warning("Review the aisle-model warnings: " + " ".join(warnings))
+                    aisle_graphic_data = create_aisle_requirements_png(
+                        detail_config,
+                        aisle_mapping["aisle_profile"],
+                        aisle_mapping["robot_width_mm"],
+                        graphic_scenarios,
+                        metric=metric,
+                    )
 
         visuals = st.session_state["analysis_visuals"]
         config_visuals = visuals.get(detail_config) if isinstance(visuals, dict) else None
@@ -890,29 +1018,29 @@ with analysis_tab:
                     "flap_margin",
                     "shelves",
                 }.issubset(visual)
+                and all(
+                    {
+                        "physical_width",
+                        "core_depth",
+                        "overhang_depth",
+                    }.issubset(shelf)
+                    for shelf in visual["shelves"]
+                )
                 for visual in config_visuals
             )
         )
         if not visuals_are_current:
             st.info(
                 "These saved results use an older 3D visualization format. "
-                "Your capacity results are still available; rerun the analysis to refresh the flap-aware 3D view."
+                "Your capacity results are still available; rerun the analysis to refresh the shelf and overhang view."
             )
         else:
-            def carton_label(row_number):
-                row = detail_results.iloc[row_number]
-                name = row.get("Carton Name")
-                if pd.isna(name) or not str(name).strip():
-                    name = row.get("SKU")
-                label = f"Carton {row_number + 1}"
-                if not pd.isna(name) and str(name).strip():
-                    label += f" - {name}"
-                return label
-
             carton_index = st.selectbox(
                 "Carton fit",
                 options=list(range(len(detail_results))),
-                format_func=carton_label,
+                format_func=lambda row_number: format_carton_label(
+                    detail_results.iloc[row_number], row_number
+                ),
                 key="carton_fit_selector",
             )
             selected_row = detail_results.iloc[carton_index]
@@ -925,6 +1053,7 @@ with analysis_tab:
             )
             st.caption(
                 "Tan shows the carton body; teal shows flap panels. "
+                "Slate shows the core shelf and teal shows its overhang. "
                 "The piece-level view is illustrative and does not change fit calculations."
             )
             if not selected_visual["shelves"]:
@@ -948,6 +1077,15 @@ with analysis_tab:
                     f"Usable shelf (W x D x H): {shelf_dimensions} "
                     f"{'mm' if metric else 'in'}"
                 )
+                display_unit = "mm" if metric else "in"
+                core_depth = shelf["core_depth"] * display_factor
+                overhang_depth = shelf["overhang_depth"] * display_factor
+                total_physical_depth = core_depth + overhang_depth
+                st.caption(
+                    f"Physical depth — core shelf: {core_depth:.2f} {display_unit}; "
+                    f"overhang: {overhang_depth:.2f} {display_unit}; "
+                    f"total: {total_physical_depth:.2f} {display_unit}"
+                )
                 st.plotly_chart(
                     make_fit_figure(shelf, shelf["placements"], metric, selected_visual),
                     use_container_width=True,
@@ -962,6 +1100,20 @@ with analysis_tab:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             on_click="ignore",
         )
+        if aisle_graphic_data is not None:
+            st.subheader("Aisle requirements image")
+            st.image(aisle_graphic_data, use_container_width=True)
+            safe_config_name = re.sub(
+                r"[^A-Za-z0-9_-]+", "_", detail_config
+            ).strip("_")[:60]
+            st.download_button(
+                "Download aisle requirements PNG",
+                data=aisle_graphic_data,
+                file_name=f"Aisle_Requirements_{safe_config_name}.png",
+                mime="image/png",
+                on_click="ignore",
+                key="download-aisle-requirements-image",
+            )
 
     st.caption("Calculations run on the hosted service. Avoid uploading data that your organization does not permit to be processed there.")
 
@@ -1024,6 +1176,7 @@ with configuration_tab:
                 st.session_state["configuration_notice"] = (
                     f"Added '{format_config_label(new_name.strip(), new_family.strip())}'."
                 )
+                st.session_state.pop("aisle-mapping-editor", None)
                 st.rerun()
 
     if managed_config_names:
@@ -1066,6 +1219,7 @@ with configuration_tab:
                         "Saved "
                         f"'{format_config_label(edited_name.strip(), edited_family.strip())}'."
                     )
+                    st.session_state.pop("aisle-mapping-editor", None)
                     st.rerun()
 
             confirmed_delete = st.checkbox(
@@ -1084,6 +1238,500 @@ with configuration_tab:
                     st.session_state["configuration_notice"] = (
                         f"Deleted '{selected_label}'."
                     )
+                    st.session_state.pop("aisle-mapping-editor", None)
                     st.rerun()
     else:
         st.info("Add a bot configuration to enable editing and analysis.")
+
+    st.subheader("Aisle width mappings")
+    st.caption(
+        "Map each capacity configuration to an aisle profile. Robot width is stored in mm; "
+        "Origin profiles require their exact catalog width. Vector profiles require a manually "
+        "entered width for reference; their aisle requirements are editable on the Aisle Width Configuration page."
+    )
+    aisle_mapping_rows = []
+    for label, record in managed_config_records.items():
+        mapping = aisle_mappings.get(label, {})
+        aisle_mapping_rows.append(
+            {
+                "Configuration Name": record["name"],
+                "Bot Family": record["bot_family"],
+                "Aisle Profile": mapping.get("aisle_profile", ""),
+                "Robot width (mm)": mapping.get("robot_width_mm"),
+            }
+        )
+    aisle_mapping_editor = st.data_editor(
+        pd.DataFrame(
+            aisle_mapping_rows,
+            columns=[
+                "Configuration Name",
+                "Bot Family",
+                "Aisle Profile",
+                "Robot width (mm)",
+            ],
+        ),
+        key="aisle-mapping-editor",
+        use_container_width=True,
+        hide_index=True,
+        disabled=["Configuration Name", "Bot Family"],
+        column_config={
+            "Aisle Profile": st.column_config.SelectboxColumn(
+                options=[""] + list(AISLE_PROFILES),
+                help="Choose the aisle profile that corresponds to this robot configuration.",
+            ),
+            "Robot width (mm)": st.column_config.NumberColumn(
+                min_value=0.01,
+                step=1.0,
+                format="%.1f",
+                help="Required for all mappings. Origin widths must match the selected profile's catalog width.",
+            ),
+        },
+    )
+    if st.button("Save aisle mappings", type="primary"):
+        mappings_to_save = []
+        for row in aisle_mapping_editor.to_dict("records"):
+            aisle_profile = str(row.get("Aisle Profile", "") or "").strip()
+            if not aisle_profile:
+                continue
+            mappings_to_save.append(
+                {
+                    "name": row["Configuration Name"],
+                    "bot_family": row["Bot Family"],
+                    "aisle_profile": aisle_profile,
+                    "robot_width_mm": row["Robot width (mm)"],
+                }
+            )
+        try:
+            save_aisle_mappings(mappings_to_save)
+        except (ValueError, sqlite3.Error, OSError) as error:
+            st.error(f"Could not save aisle mappings: {error}")
+        else:
+            st.session_state["configuration_notice"] = "Saved aisle width mappings."
+            st.session_state.pop("aisle-mapping-editor", None)
+            st.rerun()
+
+with aisle_configuration_tab:
+    st.header("Aisle width requirements")
+    st.caption(
+        "Edit the numeric requirements for the existing aisle profiles. Profile names, robot "
+        "types, hardware widths, formulas, and bot-to-profile mappings remain fixed. "
+        "Saved values are shared and apply to subsequent aisle calculations."
+    )
+
+    profile_rows = []
+    for profile_key, profile in aisle_settings["profiles"].items():
+        row = {
+            "Aisle Profile": profile_key,
+            "Robot type": profile["type"],
+            "Hardware width (mm)": profile["hardware_width_mm"],
+            "Tray radius (mm)": None,
+            "1-way minimum (mm)": None,
+            "2-way minimum (mm)": None,
+            "3-way minimum (mm)": None,
+            "1-way optimal (mm)": None,
+            "2-way optimal (mm)": None,
+            "3-way optimal (mm)": None,
+        }
+        if profile["type"] == "VECTOR":
+            for index, traffic_label in enumerate(("1-way", "2-way", "3-way")):
+                row[f"{traffic_label} minimum (mm)"] = profile["minimum_mm"][index]
+                row[f"{traffic_label} optimal (mm)"] = profile["optimal_mm"][index]
+        else:
+            row["Tray radius (mm)"] = profile["tray_radius_mm"]
+        profile_rows.append(row)
+
+    profile_editor = st.data_editor(
+        pd.DataFrame(profile_rows),
+        key="aisle-requirements-profile-editor",
+        use_container_width=True,
+        hide_index=True,
+        disabled=["Aisle Profile", "Robot type", "Hardware width (mm)"],
+        column_config={
+            "Tray radius (mm)": st.column_config.NumberColumn(
+                min_value=0.01,
+                step=1.0,
+                format="%.1f",
+                help="Editable for Origin profiles; Vector profiles use fixed aisle values below.",
+            ),
+            **{
+                f"{traffic_label} {kind} (mm)": st.column_config.NumberColumn(
+                    min_value=0.01,
+                    step=1.0,
+                    format="%.1f",
+                    help="Editable for Vector profiles; Origin widths are calculated from the shared model settings.",
+                )
+                for traffic_label in ("1-way", "2-way", "3-way")
+                for kind in ("minimum", "optimal")
+            },
+        },
+    )
+
+    origin_field_labels = {
+        "Mast to center (mm)": "mast_to_center_mm",
+        "Front edge to mast (mm)": "front_edge_to_mast_mm",
+        "Buffer (mm)": "buffer_mm",
+        "Optimal addition (mm)": "optimal_add_mm",
+        "Maximum carton height (mm)": "max_container_height_mm",
+        "Baseline depth (mm)": "baseline_depth_mm",
+    }
+    origin_rows = [
+        {
+            "Origin model": robot_type,
+            **{
+                label: constants[field]
+                for label, field in origin_field_labels.items()
+            },
+        }
+        for robot_type, constants in aisle_settings["origin_constants"].items()
+    ]
+    origin_editor = st.data_editor(
+        pd.DataFrame(origin_rows),
+        key="aisle-requirements-origin-editor",
+        use_container_width=True,
+        hide_index=True,
+        disabled=["Origin model"],
+        column_config={
+            label: st.column_config.NumberColumn(
+                min_value=0.0 if field in ("buffer_mm", "optimal_add_mm") else 0.01,
+                step=1.0,
+                format="%.5f" if field == "front_edge_to_mast_mm" else "%.1f",
+            )
+            for label, field in origin_field_labels.items()
+        },
+    )
+    one_way_minimum = st.number_input(
+        "Minimum one-way aisle width (mm)",
+        min_value=0.01,
+        value=float(aisle_settings["minimum_one_way_mm"]),
+        step=1.0,
+        key="aisle-one-way-minimum",
+        help="Floor applied to Origin one-way recommendations; it does not change Vector catalog values.",
+    )
+
+    if st.button("Save aisle-width requirements", type="primary"):
+        updated_settings = {
+            "profiles": {
+                profile_key: dict(profile)
+                for profile_key, profile in aisle_settings["profiles"].items()
+            },
+            "origin_constants": {
+                robot_type: dict(constants)
+                for robot_type, constants in aisle_settings["origin_constants"].items()
+            },
+            "minimum_one_way_mm": one_way_minimum,
+        }
+        for row in profile_editor.to_dict("records"):
+            profile_key = row["Aisle Profile"]
+            profile = updated_settings["profiles"][profile_key]
+            if profile["type"] == "VECTOR":
+                profile["minimum_mm"] = tuple(
+                    row[f"{traffic_label} minimum (mm)"]
+                    for traffic_label in ("1-way", "2-way", "3-way")
+                )
+                profile["optimal_mm"] = tuple(
+                    row[f"{traffic_label} optimal (mm)"]
+                    for traffic_label in ("1-way", "2-way", "3-way")
+                )
+            else:
+                profile["tray_radius_mm"] = row["Tray radius (mm)"]
+
+        for row in origin_editor.to_dict("records"):
+            robot_type = row["Origin model"]
+            updated_settings["origin_constants"][robot_type] = {
+                field: row[label]
+                for label, field in origin_field_labels.items()
+            }
+
+        try:
+            save_aisle_settings(updated_settings)
+        except (ValueError, sqlite3.Error, OSError) as error:
+            st.error(f"Could not save aisle-width requirements: {error}")
+        else:
+            st.success("Saved aisle-width requirements.")
+            st.rerun()
+
+with layout_preview_tab:
+    st.header("Preview alternative page layouts")
+    st.info(
+        "Visual-only samples with illustrative data. The live calculator and its results are unchanged."
+    )
+    layout_choice = st.radio(
+        "Choose a layout preview",
+        [
+            "1 · Guided flow",
+            "2 · Control/results workspace",
+            "3 · Results workbench",
+        ],
+        horizontal=True,
+        key="layout-preview-choice",
+    )
+
+    preview_summary = pd.DataFrame(
+        [
+            {
+                "Configuration": "Origin I | Compact shelf",
+                "Fitted Cartons": 3,
+                "Total Cartons Analyzed": 3,
+                "Sum of Weighted Average": 18.4,
+            },
+            {
+                "Configuration": "Origin II | Multi-level shelf",
+                "Fitted Cartons": 2,
+                "Total Cartons Analyzed": 3,
+                "Sum of Weighted Average": 15.7,
+            },
+            {
+                "Configuration": "Vector | Shelf",
+                "Fitted Cartons": 2,
+                "Total Cartons Analyzed": 3,
+                "Sum of Weighted Average": 12.2,
+            },
+        ]
+    )
+    preview_cartons = pd.DataFrame(
+        [
+            {
+                "Carton": "Carton 1 - Small carton",
+                "Length": 8,
+                "Width": 6,
+                "Height": 5,
+                "Total Cartons per Bot": 24,
+                "Fit Status": "Standard Fit",
+            },
+            {
+                "Carton": "Carton 2 - Long carton",
+                "Length": 18,
+                "Width": 12,
+                "Height": 8,
+                "Total Cartons per Bot": 8,
+                "Fit Status": "Standard Fit",
+            },
+            {
+                "Carton": "Carton 3 - Tall carton",
+                "Length": 12,
+                "Width": 10,
+                "Height": 17,
+                "Total Cartons per Bot": 0,
+                "Fit Status": "No Fit",
+            },
+        ]
+    )
+    preview_aisle_rows = pd.DataFrame(
+        [
+            {
+                "Carton": "Small carton",
+                "No-Pass (1-Way) minimum": "42.0 in",
+                "No-Pass (1-Way) optimal": "44.0 in",
+                "Pass (2-Way) minimum": "84.0 in",
+                "Pass (2-Way) optimal": "86.0 in",
+                "High-Density (3-Way) minimum": "126.0 in",
+                "High-Density (3-Way) optimal": "128.0 in",
+                "Warnings": "",
+            },
+            {
+                "Carton": "Long carton",
+                "No-Pass (1-Way) minimum": "46.0 in",
+                "No-Pass (1-Way) optimal": "48.0 in",
+                "Pass (2-Way) minimum": "92.0 in",
+                "Pass (2-Way) optimal": "94.0 in",
+                "High-Density (3-Way) minimum": "138.0 in",
+                "High-Density (3-Way) optimal": "140.0 in",
+                "Warnings": "Container depth may impact scanning.",
+            },
+            {
+                "Carton": "Tall carton",
+                "No-Pass (1-Way) minimum": "44.0 in",
+                "No-Pass (1-Way) optimal": "46.0 in",
+                "Pass (2-Way) minimum": "88.0 in",
+                "Pass (2-Way) optimal": "90.0 in",
+                "High-Density (3-Way) minimum": "132.0 in",
+                "High-Density (3-Way) optimal": "134.0 in",
+                "Warnings": "Container height exceeds the robot height limit.",
+            },
+        ]
+    )
+    preview_limiting_cartons = pd.DataFrame(
+        [
+            {
+                "Traffic pattern": "No-Pass (1-Way)",
+                "Minimum limiting carton": "Long carton",
+                "Minimum aisle width": "46.0 in",
+                "Optimal limiting carton": "Long carton",
+                "Optimal aisle width": "48.0 in",
+            },
+            {
+                "Traffic pattern": "Pass (2-Way)",
+                "Minimum limiting carton": "Long carton",
+                "Minimum aisle width": "92.0 in",
+                "Optimal limiting carton": "Long carton",
+                "Optimal aisle width": "94.0 in",
+            },
+            {
+                "Traffic pattern": "High-Density (3-Way)",
+                "Minimum limiting carton": "Long carton",
+                "Minimum aisle width": "138.0 in",
+                "Optimal limiting carton": "Long carton",
+                "Optimal aisle width": "140.0 in",
+            },
+        ]
+    )
+    preview_graphic_scenarios = [
+        {
+            "traffic_pattern": traffic_label,
+            "minimum_width_mm": 1168.4 * (index + 1),
+            "minimum_carton": "Long carton",
+            "optimal_width_mm": 1219.2 * (index + 1),
+            "optimal_carton": "Long carton",
+        }
+        for index, traffic_label in enumerate(TRAFFIC_PATTERNS)
+    ]
+    preview_aisle_graphic = create_aisle_requirements_png(
+        "Origin I | Compact shelf",
+        "Origin I | 20.25in/508mm Hinged Boxshelf",
+        508,
+        preview_graphic_scenarios,
+    )
+
+    def render_preview_setup():
+        with st.container(border=True):
+            st.subheader("Analysis setup")
+            settings_column, input_column = st.columns([1, 1.4])
+            with settings_column:
+                st.markdown("**Configurations and options**")
+                st.caption("Origin I | Compact shelf · Origin II | Multi-level shelf")
+                st.caption("Units: inches · Workflow: P2P · Carton state: Closed/Case")
+                st.caption("Stacking: enabled · Overhang override: none")
+            with input_column:
+                st.markdown("**Carton data**")
+                st.dataframe(
+                    preview_cartons[["Carton", "Length", "Width", "Height"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            st.button(
+                "Run capacity analysis",
+                disabled=True,
+                key="preview-run-analysis",
+            )
+
+    def render_preview_overview(chart_key):
+        st.subheader("Capacity overview")
+        metric_columns = st.columns(3)
+        metric_columns[0].metric("Cartons analyzed", "3")
+        metric_columns[1].metric("Top configuration", "Origin I | Compact shelf")
+        metric_columns[2].metric("Cartons fitting", "3 of 3")
+        st.plotly_chart(
+            px.bar(
+                preview_summary,
+                x="Sum of Weighted Average",
+                y="Configuration",
+                orientation="h",
+                title="Weighted average cartons per bot",
+            ),
+            use_container_width=True,
+            key=chart_key,
+        )
+        st.subheader("Carton-level capacity results")
+        st.dataframe(preview_cartons, use_container_width=True, hide_index=True)
+
+    def render_preview_fit(chart_key):
+        st.subheader("Carton fit and shelf visualization")
+        st.caption(
+            "Sample carton: Long carton · 8 cartons per bot · Tan carton body, "
+            "slate core shelf, teal overhang."
+        )
+        st.plotly_chart(
+            make_fit_figure(
+                {
+                    "width": 20,
+                    "depth": 18,
+                    "height": 16,
+                    "physical_width": 20,
+                    "core_depth": 15,
+                    "overhang_depth": 3,
+                    "placements": [],
+                },
+                [
+                    {"x": 2, "y": 2, "z": 0, "l": 8, "w": 6, "h": 5},
+                ],
+                False,
+                {
+                    "flap_state": "closed",
+                    "carton_body_dimensions": (8, 6, 5),
+                    "flap_extension": 0,
+                    "flap_margin": 0,
+                },
+            ),
+            use_container_width=True,
+            key=chart_key,
+        )
+        st.caption("Carton fit selector · Sample: Long carton")
+
+    def render_preview_aisle():
+        st.subheader("Aisle width recommendations")
+        st.caption(
+            "Mapped profile: Origin I | 20.25in/508mm Hinged Boxshelf · "
+            "Robot width: 508 mm."
+        )
+        st.dataframe(
+            preview_aisle_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.markdown("**Limiting carton by traffic pattern**")
+        st.dataframe(
+            preview_limiting_cartons,
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.image(preview_aisle_graphic, use_container_width=True)
+
+    def render_preview_downloads():
+        st.subheader("Downloads")
+        excel_column, image_column = st.columns(2)
+        excel_column.button(
+            "Download Excel results",
+            disabled=True,
+            key="preview-download-excel",
+        )
+        image_column.button(
+            "Download aisle requirements PNG",
+            disabled=True,
+            key="preview-download-png",
+        )
+        st.caption("Downloads shown for layout only; preview values are illustrative.")
+
+    if layout_choice == "1 · Guided flow":
+        st.subheader("Step 1 · Configure and enter cartons")
+        render_preview_setup()
+        st.subheader("Step 2 · Review capacity results")
+        render_preview_overview("preview-guided-overview")
+        st.subheader("Step 3 · Review aisle requirements and carton fit")
+        render_preview_aisle()
+        render_preview_fit("preview-guided-carton-fit")
+        render_preview_downloads()
+    elif layout_choice == "2 · Control/results workspace":
+        control_column, results_column = st.columns([0.85, 2.15], gap="large")
+        with control_column:
+            st.subheader("Controls")
+            render_preview_setup()
+        with results_column:
+            render_preview_overview("preview-workspace-overview")
+            with st.container(border=True):
+                render_preview_aisle()
+            with st.container(border=True):
+                render_preview_fit("preview-workspace-carton-fit")
+            render_preview_downloads()
+    else:
+        render_preview_setup()
+        overview_tab, fit_tab, aisle_tab, downloads_tab = st.tabs(
+            ["Overview", "Carton Fit", "Aisle Planning", "Downloads"]
+        )
+        with overview_tab:
+            render_preview_overview("preview-workbench-overview")
+        with fit_tab:
+            render_preview_fit("preview-workbench-carton-fit")
+        with aisle_tab:
+            render_preview_aisle()
+        with downloads_tab:
+            render_preview_downloads()

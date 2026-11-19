@@ -197,6 +197,39 @@ class PackingTests(unittest.TestCase):
         self.assertEqual([shelf["height"] for shelf in shelves], [5, 10])
         self.assertEqual([len(shelf["placements"]) for shelf in shelves], [4, 8])
 
+    def test_visual_shelf_metadata_separates_physical_overhang_from_buffer(self):
+        cartons = pd.DataFrame({"Length": [1], "Width": [1], "Height": [1]})
+        options = {
+            "metric": False,
+            "carton_state": "closed",
+            "stackable": True,
+            "max_density": False,
+            "workflow": "p2p",
+            "overhang": 5,
+            "manual_config": {
+                "width": 20,
+                "depth": 15,
+                "hgt": 10,
+                "overhang": 3,
+                "shelves": 1,
+                "buffer": 10,
+                "hinge_hgt": 0,
+                "hinge_enabled": False,
+                "payload": 0,
+            },
+        }
+
+        _, visuals = analyze_cartons_with_placements(
+            cartons, ["Manual Input"], options
+        )
+        shelf = visuals["Manual Input"][0]["shelves"][0]
+
+        self.assertEqual(shelf["physical_width"], 20)
+        self.assertEqual(shelf["core_depth"], 15)
+        self.assertEqual(shelf["overhang_depth"], 5)
+        self.assertEqual(shelf["width"], 18)
+        self.assertEqual(shelf["depth"], 18)
+
     def test_per_carton_flap_states_override_global_and_blank_uses_global(self):
         cartons = pd.DataFrame(
             {

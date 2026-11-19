@@ -5,6 +5,11 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
+from aisle_width_engine import (
+    default_aisle_settings,
+    validate_aisle_mapping,
+    validate_aisle_settings,
+)
 from capacity_engine import DEFAULT_CONFIGS
 
 
@@ -137,6 +142,39 @@ def _create_config_table(connection, table_name="bot_configurations"):
     )
 
 
+def _create_aisle_mapping_table(connection):
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS aisle_width_mappings (
+            name TEXT NOT NULL COLLATE NOCASE,
+            bot_family TEXT NOT NULL COLLATE NOCASE,
+            aisle_profile TEXT NOT NULL,
+            robot_width_mm REAL NOT NULL CHECK (robot_width_mm > 0),
+            PRIMARY KEY (name, bot_family)
+        )
+        """
+    )
+
+
+def _create_aisle_settings_table(connection):
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS aisle_width_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            settings_json TEXT NOT NULL
+        )
+        """
+    )
+    settings = default_aisle_settings()
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO aisle_width_settings (id, settings_json)
+        VALUES (1, ?)
+        """,
+        (json.dumps(settings, allow_nan=False),),
+    )
+
+
 def _migrate_config_table(connection):
     columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(bot_configurations)")
@@ -174,6 +212,9 @@ def initialize_config_store(db_path=None):
             _create_config_table(connection)
         else:
             _migrate_config_table(connection)
+
+        _create_aisle_mapping_table(connection)
+        _create_aisle_settings_table(connection)
 
         if connection.execute("SELECT COUNT(*) FROM bot_configurations").fetchone()[0] == 0:
             for legacy_name, config in DEFAULT_CONFIGS.items():
@@ -282,6 +323,15 @@ def save_config(
                         f"Configuration '{format_config_label(original_name, original_bot_family)}' "
                         "does not exist."
                     )
+                connection.execute(
+                    """
+                    UPDATE aisle_width_mappings
+                    SET name = ?, bot_family = ?
+                    WHERE name = ? COLLATE NOCASE
+                    AND bot_family = ? COLLATE NOCASE
+                    """,
+                    (name, bot_family, original_name, original_bot_family),
+                )
         except sqlite3.IntegrityError:
             label = format_config_label(name, bot_family)
             raise ValueError(f"A configuration named '{label}' already exists.") from None
@@ -300,6 +350,13 @@ def delete_config(name, bot_family, db_path=None):
         ).fetchone()[0]
         if count <= 1:
             raise ValueError("At least one bot configuration must remain.")
+        connection.execute(
+            """
+            DELETE FROM aisle_width_mappings
+            WHERE name = ? COLLATE NOCASE AND bot_family = ? COLLATE NOCASE
+            """,
+            (name, bot_family),
+        )
         cursor = connection.execute(
             """
             DELETE FROM bot_configurations
@@ -311,3 +368,114 @@ def delete_config(name, bot_family, db_path=None):
             raise ValueError(
                 f"Configuration '{format_config_label(name, bot_family)}' does not exist."
             )
+
+
+def load_aisle_mappings(db_path=None):
+    initialize_config_store(db_path)
+    with closing(_connect(db_path)) as connection, connection:
+        rows = connection.execute(
+            """
+            SELECT name, bot_family, aisle_profile, robot_width_mm
+            FROM aisle_width_mappings
+            ORDER BY bot_family COLLATE NOCASE, name COLLATE NOCASE
+            """
+        ).fetchall()
+    return {
+        format_config_label(row["name"], row["bot_family"]): {
+            "name": row["name"],
+            "bot_family": row["bot_family"],
+            "aisle_profile": row["aisle_profile"],
+            "robot_width_mm": row["robot_width_mm"],
+        }
+        for row in rows
+    }
+
+
+def save_aisle_mappings(mappings, db_path=None):
+    validated_mappings = []
+    seen_configurations = set()
+    for mapping in mappings:
+        name = str(mapping.get("name", "")).strip()
+        bot_family = str(mapping.get("bot_family", "")).strip()
+        if not name or not bot_family:
+            raise ValueError("Every aisle mapping needs a configuration name and bot family.")
+        if name.casefold() == MANUAL_CONFIG_NAME.casefold():
+            raise ValueError(f"'{MANUAL_CONFIG_NAME}' cannot have an aisle mapping.")
+        key = (name.casefold(), bot_family.casefold())
+        if key in seen_configurations:
+            raise ValueError(
+                f"Configuration '{format_config_label(name, bot_family)}' has more than one aisle mapping."
+            )
+        seen_configurations.add(key)
+
+        profile = str(mapping.get("aisle_profile", "")).strip()
+        if not profile:
+            raise ValueError(
+                f"Choose an aisle profile for '{format_config_label(name, bot_family)}'."
+            )
+        width = validate_aisle_mapping(profile, mapping.get("robot_width_mm"))
+        validated_mappings.append((name, bot_family, profile, width))
+
+    initialize_config_store(db_path)
+    with closing(_connect(db_path)) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        configurations = {
+            (row["name"].casefold(), row["bot_family"].casefold())
+            for row in connection.execute(
+                "SELECT name, bot_family FROM bot_configurations"
+            )
+        }
+        missing = [
+            format_config_label(name, bot_family)
+            for name, bot_family, _, _ in validated_mappings
+            if (name.casefold(), bot_family.casefold()) not in configurations
+        ]
+        if missing:
+            raise ValueError(
+                "Aisle mappings refer to missing configurations: "
+                + ", ".join(missing)
+                + "."
+            )
+
+        connection.execute("DELETE FROM aisle_width_mappings")
+        connection.executemany(
+            """
+            INSERT INTO aisle_width_mappings
+                (name, bot_family, aisle_profile, robot_width_mm)
+            VALUES (?, ?, ?, ?)
+            """,
+            validated_mappings,
+        )
+
+
+def load_aisle_settings(db_path=None):
+    initialize_config_store(db_path)
+    with closing(_connect(db_path)) as connection, connection:
+        row = connection.execute(
+            "SELECT settings_json FROM aisle_width_settings WHERE id = 1"
+        ).fetchone()
+    if row is None:
+        raise ValueError("Aisle-width settings are missing from the configuration store.")
+    try:
+        settings = json.loads(row["settings_json"])
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Stored aisle-width settings are invalid: {error}") from error
+    return validate_aisle_settings(settings)
+
+
+def save_aisle_settings(settings, db_path=None):
+    validated_settings = validate_aisle_settings(settings)
+    encoded_settings = json.dumps(validated_settings, allow_nan=False)
+    initialize_config_store(db_path)
+    with closing(_connect(db_path)) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute(
+            """
+            UPDATE aisle_width_settings
+            SET settings_json = ?
+            WHERE id = 1
+            """,
+            (encoded_settings,),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError("Aisle-width settings are missing from the configuration store.")

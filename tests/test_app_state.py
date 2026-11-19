@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -9,7 +10,13 @@ import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 from capacity_engine import DEFAULT_CONFIGS, analyze_cartons
-from config_store import load_configs, save_config
+from config_store import (
+    load_aisle_mappings,
+    load_aisle_settings,
+    load_configs,
+    save_aisle_mappings,
+    save_config,
+)
 
 
 class AppStateTests(unittest.TestCase):
@@ -25,7 +32,8 @@ class AppStateTests(unittest.TestCase):
         app_path = Path(__file__).resolve().parents[1] / "app.py"
         app = AppTest.from_file(str(app_path), default_timeout=20).run()
         self.assertFalse(app.exception)
-        self.assertIn("Manage configurations", [tab.label for tab in app.tabs])
+        self.assertIn("Manage Bot Configurations", [tab.label for tab in app.tabs])
+        self.assertIn("Aisle Width Configuration", [tab.label for tab in app.tabs])
         next(
             item for item in app.text_input if item.label == "Configuration name"
         ).set_value("New Bot")
@@ -99,6 +107,46 @@ class AppStateTests(unittest.TestCase):
             sorted(pairs, key=lambda pair: (pair[0].casefold(), pair[1].casefold())),
         )
 
+    def test_layout_preview_tab_displays_three_mockups_without_running_analysis(self):
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        app = AppTest.from_file(str(app_path), default_timeout=20).run()
+
+        self.assertFalse(app.exception)
+        self.assertIn("Layout Previews", [tab.label for tab in app.tabs])
+        self.assertTrue(
+            any(
+                "Visual-only samples with illustrative data" in item.value
+                for item in app.info
+            )
+        )
+        layout_selector = next(
+            item for item in app.radio if item.key == "layout-preview-choice"
+        )
+        layouts = layout_selector.options
+        self.assertEqual(
+            layouts,
+            [
+                "1 · Guided flow",
+                "2 · Control/results workspace",
+                "3 · Results workbench",
+            ],
+        )
+        self.assertIsNone(app.session_state["analysis_results"])
+
+        for layout in layouts:
+            with self.subTest(layout=layout):
+                next(
+                    item
+                    for item in app.radio
+                    if item.key == "layout-preview-choice"
+                ).set_value(layout).run()
+                self.assertFalse(app.exception)
+                self.assertIsNone(app.session_state["analysis_results"])
+                self.assertIn(
+                    "Carton-level capacity results",
+                    [item.value for item in app.subheader],
+                )
+
     def test_analysis_results_survive_configuration_detail_reruns(self):
         configs = [
             name
@@ -108,6 +156,10 @@ class AppStateTests(unittest.TestCase):
         app_path = Path(__file__).resolve().parents[1] / "app.py"
         app = AppTest.from_file(str(app_path), default_timeout=20).run()
         app.multiselect[0].set_value(configs)
+        next(
+            item for item in app.text_input
+            if item.label.startswith("Global overhang override")
+        ).set_value("3")
         app.text_area[0].set_value(
             "Carton Name\tLength\tWidth\tHeight\tFlap State\n"
             "Sample\t5\t5\t5\tFlaps Up"
@@ -133,8 +185,206 @@ class AppStateTests(unittest.TestCase):
         fit_trace_names = [trace.get("name") for trace in fit_chart["data"]]
         self.assertIn("Carton body", fit_trace_names)
         self.assertIn("Flaps", fit_trace_names)
-        self.assertEqual(app.session_state["analysis_visual_schema_version"], 1)
+        self.assertIn("Core shelf", fit_trace_names)
+        self.assertIn("Overhang extension", fit_trace_names)
+        shelf_visual = app.session_state["analysis_visuals"][configs[1]][0]["shelves"][0]
+        self.assertEqual(
+            shelf_visual["core_depth"],
+            load_configs(self.database)[configs[1]]["depth"],
+        )
+        self.assertEqual(shelf_visual["overhang_depth"], 3)
+        self.assertEqual(app.session_state["analysis_visual_schema_version"], 2)
         self.assertFalse(app.exception)
+
+    def test_aisle_recommendations_cover_all_cartons_for_mapped_configuration(self):
+        config_label = next(
+            name
+            for name in DEFAULT_CONFIGS
+            if name.endswith("| OI") and "2-Level Box Shelf | OI" in name
+        )
+        config_name, bot_family = config_label.rsplit(" | ", 1)
+        save_aisle_mappings(
+            [
+                {
+                    "name": config_name,
+                    "bot_family": bot_family,
+                    "aisle_profile": "Origin I | 20.25in/508mm Hinged Boxshelf",
+                    "robot_width_mm": 508,
+                }
+            ],
+            db_path=self.database,
+        )
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        app = AppTest.from_file(str(app_path), default_timeout=20).run()
+        app.multiselect[0].set_value([config_label])
+        app.text_area[0].set_value(
+            "Carton Name\tLength\tWidth\tHeight\n"
+            "Small\t5\t5\t5\n"
+            "Large\t20\t20\t10"
+        )
+        app.run()
+        next(
+            button for button in app.button if button.label == "Run capacity analysis"
+        ).click().run()
+
+        self.assertFalse(app.exception)
+        aisle_tables = [
+            item.value
+            for item in app.dataframe
+            if {"Traffic pattern", "Optimal limiting carton"}.issubset(
+                item.value.columns
+            )
+        ]
+        summary = next(
+            table
+            for table in aisle_tables
+            if "Carton 2 - Large" in table["Optimal limiting carton"].values
+        )
+        two_way = summary.loc[summary["Traffic pattern"] == "Pass (2-Way)"].iloc[0]
+        self.assertEqual(two_way["Minimum limiting carton"], "Carton 2 - Large")
+        self.assertEqual(two_way["Optimal limiting carton"], "Carton 2 - Large")
+        carton_table = next(
+            item.value
+            for item in app.dataframe
+            if "Largest optimal aisle need" in item.value.columns
+        )
+        large_carton = carton_table.loc[
+            carton_table["Carton"] == "Carton 2 - Large"
+        ].iloc[0]
+        self.assertIn("Pass (2-Way)", large_carton["Largest optimal aisle need"])
+        self.assertIn("Aisle width recommendations", [item.value for item in app.subheader])
+
+        next(toggle for toggle in app.toggle if toggle.label == "Metric units (mm / kg)").set_value(
+            True
+        ).run()
+        metric_summary = next(
+            item.value
+            for item in app.dataframe
+            if {"Traffic pattern", "Optimal limiting carton"}.issubset(
+                item.value.columns
+            )
+            and "Carton 2 - Large" in item.value["Optimal limiting carton"].values
+        )
+        metric_two_way = metric_summary.loc[
+            metric_summary["Traffic pattern"] == "Pass (2-Way)"
+        ].iloc[0]
+        large_carton_radius = math.sqrt(
+            (508 / 2) ** 2 + (abs(139.41502 - 195) + 508 / 2) ** 2
+        )
+        expected_width_mm = 2 * (max(334.0, large_carton_radius) + 75) * 2
+        self.assertEqual(
+            metric_two_way["Minimum aisle width"],
+            f"{expected_width_mm:.1f} mm",
+        )
+        download_buttons = app.get("download_button")
+        self.assertIn(
+            "Download aisle requirements PNG",
+            [item.label for item in download_buttons],
+        )
+
+    def test_manage_configurations_shows_aisle_mapping_editor(self):
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        app = AppTest.from_file(str(app_path), default_timeout=20).run()
+        self.assertFalse(app.exception)
+
+        editors = [item.value for item in app.data_editor]
+        self.assertTrue(any("Aisle Profile" in editor.columns for editor in editors))
+        mapping_editor = next(
+            editor for editor in editors if "Aisle Profile" in editor.columns
+        )
+        self.assertIn("Robot width (mm)", mapping_editor.columns)
+
+    def test_aisle_configuration_page_saves_existing_profile_requirements(self):
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        app = AppTest.from_file(str(app_path), default_timeout=20).run()
+        self.assertFalse(app.exception)
+        self.assertIn("Aisle Width Configuration", [tab.label for tab in app.tabs])
+
+        editor = next(
+            item
+            for item in app.data_editor
+            if "Robot type" in item.value.columns
+        )
+        edited_table = editor.value.copy()
+        row_index = edited_table.index[
+            edited_table["Aisle Profile"] == "Vector | Shelf"
+        ][0]
+        edited_table.at[row_index, "1-way minimum (mm)"] = 1400.0
+        edited_table.at[row_index, "1-way optimal (mm)"] = 1600.0
+        app.session_state["aisle-requirements-profile-editor"] = {
+            "edited_rows": {
+                row_index: {
+                    "1-way minimum (mm)": 1400.0,
+                    "1-way optimal (mm)": 1600.0,
+                }
+            },
+            "added_rows": [],
+            "deleted_rows": [],
+        }
+        app.run()
+        next(
+            button
+            for button in app.button
+            if button.label == "Save aisle-width requirements"
+        ).click().run()
+
+        self.assertFalse(app.exception)
+        settings = load_aisle_settings(self.database)
+        self.assertEqual(
+            settings["profiles"]["Vector | Shelf"]["minimum_mm"][0],
+            1400,
+        )
+        self.assertEqual(
+            settings["profiles"]["Vector | Shelf"]["optimal_mm"][0],
+            1600,
+        )
+
+    def test_manage_configurations_saves_edited_aisle_mapping(self):
+        config_label = next(
+            name
+            for name in DEFAULT_CONFIGS
+            if name.endswith("| OI") and "2-Level Box Shelf | OI" in name
+        )
+        config_name, bot_family = config_label.rsplit(" | ", 1)
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        app = AppTest.from_file(str(app_path), default_timeout=20).run()
+        editor = next(
+            item
+            for item in app.data_editor
+            if "Aisle Profile" in item.value.columns
+        )
+        edited_table = editor.value.copy()
+        row_index = edited_table.index[
+            (edited_table["Configuration Name"] == config_name)
+            & (edited_table["Bot Family"] == bot_family)
+        ][0]
+        edited_table.at[row_index, "Aisle Profile"] = (
+            "Origin I | 20.25in/508mm Hinged Boxshelf"
+        )
+        edited_table.at[row_index, "Robot width (mm)"] = 508.0
+        app.session_state["aisle-mapping-editor"] = {
+            "edited_rows": {
+                row_index: {
+                    "Aisle Profile": edited_table.at[row_index, "Aisle Profile"],
+                    "Robot width (mm)": edited_table.at[
+                        row_index, "Robot width (mm)"
+                    ],
+                }
+            },
+            "added_rows": [],
+            "deleted_rows": [],
+        }
+        app.run()
+        next(
+            button for button in app.button if button.label == "Save aisle mappings"
+        ).click().run()
+
+        self.assertFalse(app.exception)
+        saved = load_aisle_mappings(self.database)
+        self.assertEqual(
+            saved[config_label]["aisle_profile"],
+            "Origin I | 20.25in/508mm Hinged Boxshelf",
+        )
 
     def test_optimization_filters_by_explicit_family_not_name_suffix(self):
         source_config = next(
@@ -202,7 +452,7 @@ class AppStateTests(unittest.TestCase):
         self.assertEqual(visual["flap_state"], "folded")
         self.assertEqual(app.selectbox[0].value, configs[0])
         self.assertEqual(app.selectbox[1].value, 0)
-        self.assertEqual(app.session_state["analysis_visual_schema_version"], 1)
+        self.assertEqual(app.session_state["analysis_visual_schema_version"], 2)
         self.assertFalse(app.exception)
 
     def test_stale_visualization_session_keeps_results_and_prompts_for_rerun(self):
@@ -256,8 +506,22 @@ class AppStateTests(unittest.TestCase):
 
         self.assertFalse(app.exception)
         self.assertEqual(list(app.session_state["analysis_results"]), ["Manual Input"])
-        self.assertIn("older 3D visualization format", app.info[0].value)
-        self.assertEqual(len(app.get("plotly_chart")), 1)
+        self.assertTrue(
+            any("older 3D visualization format" in item.value for item in app.info)
+        )
+        chart_specs = [
+            json.loads(chart.proto.spec)
+            for chart in app.get("plotly_chart")
+        ]
+        chart_titles = [
+            spec.get("layout", {}).get("title", {}).get("text")
+            for spec in chart_specs
+        ]
+        self.assertEqual(chart_titles.count("Weighted average cartons per bot"), 1)
+        self.assertEqual(
+            chart_titles.count("Preview weighted average cartons per bot"),
+            1,
+        )
         self.assertGreaterEqual(len(app.dataframe), 2)
 
 

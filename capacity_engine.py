@@ -248,6 +248,8 @@ def analyze_cartons_with_placements(dataframe, selected_configs, options, config
         shelf_l = config.get("width", 0)
         shelf_w = config.get("depth", 0)
         shelf_h = config.get("hgt", 0)
+        hinge_shelf_l = config.get("hng_width", shelf_l)
+        hinge_shelf_w = config.get("hng_depth", shelf_w)
         hinge_h = config.get("hinge_hgt", 0) * factor
         usable_l = round(shelf_l * factor, 2)
         usable_w = round((shelf_w + cfg_overhang) * factor, 2)
@@ -256,6 +258,13 @@ def analyze_cartons_with_placements(dataframe, selected_configs, options, config
         heights = shelf_h if isinstance(shelf_h, list) else [shelf_h]
         shelf_count = len(heights) if isinstance(shelf_h, list) else int(config.get("shelves", 1))
         payload = float(config.get("payload", 0))
+
+        def shelf_visual_dimensions(physical_width, core_depth):
+            return {
+                "physical_width": physical_width,
+                "core_depth": core_depth,
+                "overhang_depth": cfg_overhang,
+            }
 
         results = df_input.copy()
         if (results["Flap State"] == FLAP_STATES["flaps up"][1]).any():
@@ -304,6 +313,7 @@ def analyze_cartons_with_placements(dataframe, selected_configs, options, config
                             "depth": usable_w,
                             "height": usable_h,
                             "placements": coords,
+                            **shelf_visual_dimensions(shelf_l, shelf_w),
                         }
                     )
                 capacity = total
@@ -347,6 +357,7 @@ def analyze_cartons_with_placements(dataframe, selected_configs, options, config
                             "height": usable_h,
                             "placements": coords,
                             "identical_shelves": shelf_count,
+                            **shelf_visual_dimensions(shelf_l, shelf_w),
                         }
                     )
                     status = "Standard Fit"
@@ -366,6 +377,7 @@ def analyze_cartons_with_placements(dataframe, selected_configs, options, config
                             "placements": hinge_coords,
                             "identical_shelves": 1,
                             "hinge": True,
+                            **shelf_visual_dimensions(hinge_shelf_l, hinge_shelf_w),
                         }
                     )
                     status = "Hinge Required"
@@ -384,6 +396,7 @@ def analyze_cartons_with_placements(dataframe, selected_configs, options, config
                             "depth": usable_w,
                             "height": usable_h,
                             "placements": [],
+                            **shelf_visual_dimensions(shelf_l, shelf_w),
                         }
                     )
                     shelf_description = (

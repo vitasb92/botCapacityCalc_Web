@@ -5,12 +5,17 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
+from aisle_width_engine import default_aisle_settings
 from capacity_engine import DEFAULT_CONFIGS
 from config_store import (
     MANUAL_CONFIG_NAME,
     delete_config,
+    load_aisle_mappings,
+    load_aisle_settings,
     load_config_records,
     load_configs,
+    save_aisle_mappings,
+    save_aisle_settings,
     save_config,
     validate_config,
 )
@@ -27,6 +32,7 @@ class ConfigurationStoreTests(unittest.TestCase):
     def test_initializes_from_defaults_with_sorted_family_labels(self):
         configs = load_configs(self.database)
         self.assertEqual(configs, DEFAULT_CONFIGS)
+        self.assertEqual(load_aisle_mappings(self.database), {})
         records = load_config_records(self.database)
         self.assertEqual(records[0]["name"], MANUAL_CONFIG_NAME)
         managed = records[1:]
@@ -46,6 +52,40 @@ class ConfigurationStoreTests(unittest.TestCase):
         configs = load_configs(self.database)
         self.assertEqual(configs["Example Bot | New Family"]["width"], 42)
         self.assertIn(MANUAL_CONFIG_NAME, configs)
+        self.assertEqual(load_aisle_settings(self.database), default_aisle_settings())
+
+    def test_persists_edited_aisle_requirements_without_changing_profiles(self):
+        settings = default_aisle_settings()
+        settings["profiles"]["Origin I | 20.25in/508mm Hinged Boxshelf"][
+            "tray_radius_mm"
+        ] = 350
+        settings["profiles"]["Vector | Shelf"]["minimum_mm"] = (1400, 2700, 4000)
+        settings["profiles"]["Vector | Shelf"]["optimal_mm"] = (1600, 3200, 4800)
+        settings["origin_constants"]["ORIGIN 1"]["buffer_mm"] = 80
+        settings["minimum_one_way_mm"] = 1200
+
+        save_aisle_settings(settings, db_path=self.database)
+        loaded = load_aisle_settings(self.database)
+
+        self.assertEqual(
+            loaded["profiles"]["Origin I | 20.25in/508mm Hinged Boxshelf"][
+                "tray_radius_mm"
+            ],
+            350,
+        )
+        self.assertEqual(
+            loaded["profiles"]["Vector | Shelf"]["minimum_mm"],
+            (1400.0, 2700.0, 4000.0),
+        )
+        self.assertEqual(loaded["origin_constants"]["ORIGIN 1"]["buffer_mm"], 80)
+        self.assertEqual(loaded["minimum_one_way_mm"], 1200)
+
+    def test_rejects_invalid_aisle_requirements(self):
+        settings = default_aisle_settings()
+        settings["profiles"]["Vector | Shelf"]["minimum_mm"] = (2000, 2500, 3750)
+
+        with self.assertRaisesRegex(ValueError, "must not be smaller"):
+            save_aisle_settings(settings, db_path=self.database)
 
     def test_migrates_legacy_names_and_keeps_manual_input(self):
         default_config = next(
@@ -86,6 +126,13 @@ class ConfigurationStoreTests(unittest.TestCase):
                 row[1] for row in connection.execute("PRAGMA table_info(bot_configurations)")
             }
             self.assertIn("bot_family", columns)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'aisle_width_mappings'"
+                ).fetchone()[0],
+                1,
+            )
             self.assertEqual(
                 connection.execute(
                     "SELECT COUNT(*) FROM sqlite_master "
@@ -136,6 +183,69 @@ class ConfigurationStoreTests(unittest.TestCase):
 
         delete_config("Renamed Shelf", "New Family", self.database)
         self.assertNotIn("Renamed Shelf | New Family", load_configs(self.database))
+
+    def test_aisle_mapping_follows_configuration_rename_and_is_deleted_with_config(self):
+        record = next(
+            record
+            for record in load_config_records(self.database)
+            if record["name"] != MANUAL_CONFIG_NAME
+        )
+        save_aisle_mappings(
+            [
+                {
+                    "name": record["name"],
+                    "bot_family": record["bot_family"],
+                    "aisle_profile": "Origin I | 20.25in/508mm Hinged Boxshelf",
+                    "robot_width_mm": 508,
+                }
+            ],
+            db_path=self.database,
+        )
+        original_label = f"{record['name']} | {record['bot_family']}"
+        self.assertIn(original_label, load_aisle_mappings(self.database))
+
+        updated = dict(record["config"])
+        save_config(
+            "Renamed Shelf",
+            "New Family",
+            updated,
+            original_name=record["name"],
+            original_bot_family=record["bot_family"],
+            db_path=self.database,
+        )
+        mappings = load_aisle_mappings(self.database)
+        renamed_label = "Renamed Shelf | New Family"
+        self.assertNotIn(original_label, mappings)
+        self.assertEqual(mappings[renamed_label]["robot_width_mm"], 508.0)
+
+        delete_config("Renamed Shelf", "New Family", self.database)
+        self.assertNotIn(renamed_label, load_aisle_mappings(self.database))
+
+    def test_aisle_mapping_rejects_bad_catalog_widths_and_missing_configurations(self):
+        record = next(
+            record
+            for record in load_config_records(self.database)
+            if record["name"] != MANUAL_CONFIG_NAME
+        )
+        mapping = {
+            "name": record["name"],
+            "bot_family": record["bot_family"],
+            "aisle_profile": "Origin I | 20.25in/508mm Hinged Boxshelf",
+            "robot_width_mm": 520,
+        }
+
+        with self.assertRaisesRegex(ValueError, "must match its catalog width"):
+            save_aisle_mappings([mapping], db_path=self.database)
+
+        mapping["robot_width_mm"] = 508
+        mapping["name"] = "Missing Configuration"
+        with self.assertRaisesRegex(ValueError, "refer to missing configurations"):
+            save_aisle_mappings([mapping], db_path=self.database)
+
+        mapping["name"] = record["name"]
+        mapping["aisle_profile"] = "Unknown profile"
+        with self.assertRaisesRegex(ValueError, "Unrecognized aisle profile"):
+            save_aisle_mappings([mapping], db_path=self.database)
 
     def test_zeroes_hinge_dimensions_when_fallback_is_disabled_on_add_and_edit(self):
         config = next(
