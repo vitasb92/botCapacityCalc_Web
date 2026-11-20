@@ -1,6 +1,7 @@
 import json
 import math
 import os
+from html import escape as escape_html
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from unittest.mock import patch
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
+from brand_palette import ACCENT_ORANGE, ACCENT_YELLOW, LOCUS_BLUE, NEUTRAL_DARK
 from capacity_engine import DEFAULT_CONFIGS, analyze_cartons
 from config_store import (
     load_aisle_mappings,
@@ -107,45 +109,80 @@ class AppStateTests(unittest.TestCase):
             sorted(pairs, key=lambda pair: (pair[0].casefold(), pair[1].casefold())),
         )
 
-    def test_layout_preview_tab_displays_three_mockups_without_running_analysis(self):
+    def test_results_workbench_renders_cards_and_switchable_carton_fit(self):
+        config_labels = [
+            name for name in DEFAULT_CONFIGS if name.endswith("| OI")
+        ][:2]
         app_path = Path(__file__).resolve().parents[1] / "app.py"
         app = AppTest.from_file(str(app_path), default_timeout=20).run()
+        app.multiselect[0].set_value(config_labels)
+        app.text_area[0].set_value(
+            "Carton Name\tLength\tWidth\tHeight\n"
+            "Short\t5\t5\t5\n"
+            "Tall\t8\t8\t8"
+        )
+        app.run()
+        next(
+            button for button in app.button if button.label == "Run capacity analysis"
+        ).click().run()
 
         self.assertFalse(app.exception)
-        self.assertIn("Layout Previews", [tab.label for tab in app.tabs])
-        self.assertTrue(
-            any(
-                "Visual-only samples with illustrative data" in item.value
-                for item in app.info
-            )
-        )
-        layout_selector = next(
-            item for item in app.radio if item.key == "layout-preview-choice"
-        )
-        layouts = layout_selector.options
-        self.assertEqual(
-            layouts,
-            [
-                "1 · Guided flow",
-                "2 · Control/results workspace",
-                "3 · Results workbench",
-            ],
-        )
-        self.assertIsNone(app.session_state["analysis_results"])
+        tab_labels = [tab.label for tab in app.tabs]
+        self.assertNotIn("Layout Previews", tab_labels)
+        for label in ("Overview", "Carton Fit", "Aisle Planning", "Downloads"):
+            self.assertIn(label, tab_labels)
 
-        for layout in layouts:
-            with self.subTest(layout=layout):
-                next(
-                    item
-                    for item in app.radio
-                    if item.key == "layout-preview-choice"
-                ).set_value(layout).run()
-                self.assertFalse(app.exception)
-                self.assertIsNone(app.session_state["analysis_results"])
-                self.assertIn(
-                    "Carton-level capacity results",
-                    [item.value for item in app.subheader],
-                )
+        summary = app.session_state["analysis_summary"]
+        kpi_cards = [
+            item.value
+            for item in app.markdown
+            if "overview-kpi-card" in item.value
+        ]
+        self.assertEqual(len(kpi_cards), 4)
+        for card in kpi_cards:
+            self.assertIn("height: 132px;", card)
+            self.assertIn(f"border-top: 4px solid {LOCUS_BLUE};", card)
+
+        carton_card = next(card for card in kpi_cards if "Cartons analyzed" in card)
+        self.assertIn(">2</div>", carton_card)
+        configuration_card = next(
+            card for card in kpi_cards if "Top configuration" in card
+        )
+        self.assertIn(
+            escape_html(summary.iloc[0]["Configuration"]),
+            configuration_card,
+        )
+        self.assertIn("font-size: 1rem;", configuration_card)
+        compared_card = next(
+            card for card in kpi_cards if "Configurations compared" in card
+        )
+        self.assertIn(">2</div>", compared_card)
+        weighted_average_card = next(
+            card for card in kpi_cards if "Top weighted average" in card
+        )
+        self.assertIn(
+            f">{summary.iloc[0]['Sum of Weighted Average']:.2f}</div>",
+            weighted_average_card,
+        )
+
+        summary_chart = json.loads(app.get("plotly_chart")[0].proto.spec)
+        self.assertEqual(summary_chart["data"][0]["marker"]["color"], LOCUS_BLUE)
+
+        carton_selector = next(
+            item for item in app.selectbox if item.key == "carton_fit_selector"
+        )
+        self.assertEqual(
+            carton_selector.options,
+            ["Carton 1 - Short", "Carton 2 - Tall"],
+        )
+        carton_selector.set_value("Carton 2 - Tall").run()
+        self.assertEqual(
+            next(
+                item for item in app.selectbox if item.key == "carton_fit_selector"
+            ).value,
+            1,
+        )
+        self.assertFalse(app.exception)
 
     def test_analysis_results_survive_configuration_detail_reruns(self):
         configs = [
@@ -187,6 +224,11 @@ class AppStateTests(unittest.TestCase):
         self.assertIn("Flaps", fit_trace_names)
         self.assertIn("Core shelf", fit_trace_names)
         self.assertIn("Overhang extension", fit_trace_names)
+        fit_traces = {trace["name"]: trace for trace in fit_chart["data"]}
+        self.assertEqual(fit_traces["Carton body"]["color"], ACCENT_ORANGE)
+        self.assertEqual(fit_traces["Flaps"]["color"], ACCENT_YELLOW)
+        self.assertEqual(fit_traces["Core shelf"]["color"], NEUTRAL_DARK)
+        self.assertEqual(fit_traces["Overhang extension"]["color"], LOCUS_BLUE)
         shelf_visual = app.session_state["analysis_visuals"][configs[1]][0]["shelves"][0]
         self.assertEqual(
             shelf_visual["core_depth"],
@@ -520,7 +562,7 @@ class AppStateTests(unittest.TestCase):
         self.assertEqual(chart_titles.count("Weighted average cartons per bot"), 1)
         self.assertEqual(
             chart_titles.count("Preview weighted average cartons per bot"),
-            1,
+            0,
         )
         self.assertGreaterEqual(len(app.dataframe), 2)
 
